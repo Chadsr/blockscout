@@ -48,6 +48,11 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
         changes[:index] == 0 && changes[:input] == %Explorer.Chain.Data{bytes: ""}
       end)
 
+    all_first_traces =
+      Enum.filter(changes_list, fn changes ->
+        changes[:index] == 0
+      end)
+
     transactions_timeout = options[Runner.Transactions.option_key()][:timeout] || Runner.Transactions.timeout()
 
     update_transactions_options = %{timeout: transactions_timeout, timestamps: timestamps}
@@ -84,8 +89,8 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
     |> Multi.run(:internal_transactions, fn repo, %{valid_internal_transactions: valid_internal_transactions} ->
       insert(repo, valid_internal_transactions, insert_options)
     end)
-    |> Multi.run(:update_transactions, fn repo, %{acquire_transactions: transactions} ->
-      update_transactions(repo, transactions, changes_list, update_transactions_options)
+    |> Multi.run(:update_transactions, fn repo, %{valid_internal_transactions: valid_internal_transactions} ->
+      update_transactions(repo, valid_internal_transactions, all_first_traces, update_transactions_options)
     end)
     |> Multi.run(:remove_consensus_of_invalid_blocks, fn repo, %{invalid_block_numbers: invalid_block_numbers} ->
       remove_consensus_of_invalid_blocks(repo, invalid_block_numbers)
@@ -321,13 +326,13 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
     end
   end
 
-  defp update_transactions(repo, transactions, first_traces, %{
+  defp update_transactions(repo, internal_transactions, first_traces, %{
          timeout: timeout,
          timestamps: timestamps
        }) do
-    transactions_count = Enum.count(transactions)
+    internal_transactions_count = Enum.count(internal_transactions)
 
-    if transactions_count == 0 do
+    if internal_transactions_count == 0 do
       {:ok, nil}
     else
       params =
