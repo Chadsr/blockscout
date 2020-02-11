@@ -58,7 +58,10 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
     update_transactions_options = %{timeout: transactions_timeout, timestamps: timestamps}
 
     # filter out params with just `block_number` (indicating blocks without internal transactions)
-    internal_transactions_params =
+    internal_transactions_params = Enum.filter(changes_list, &Map.has_key?(&1, :type))
+
+    # internal transactions for update
+    internal_transactions_for_update_transactions_params =
       Enum.filter(changes_list_without_first_traces_of_trivial_transactions, &Map.has_key?(&1, :type))
 
     # Enforce ShareLocks tables order (see docs: sharelocks.md)
@@ -80,7 +83,11 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
                                                     acquire_transactions: transactions,
                                                     invalid_block_numbers: invalid_block_numbers
                                                   } ->
-      valid_internal_transactions(transactions, internal_transactions_params, invalid_block_numbers)
+      valid_internal_transactions(
+        transactions,
+        internal_transactions_for_update_transactions_params,
+        invalid_block_numbers
+      )
     end)
     |> Multi.run(:remove_left_over_internal_transactions, fn repo,
                                                              %{valid_internal_transactions: valid_internal_transactions} ->
@@ -326,13 +333,13 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
     end
   end
 
-  defp update_transactions(repo, internal_transactions, first_traces, %{
+  defp update_transactions(repo, valid_internal_transactions, first_traces, %{
          timeout: timeout,
          timestamps: timestamps
        }) do
-    internal_transactions_count = Enum.count(internal_transactions)
+    valid_internal_transactions_count = Enum.count(valid_internal_transactions)
 
-    if internal_transactions_count == 0 do
+    if valid_internal_transactions_count == 0 do
       {:ok, nil}
     else
       params =
@@ -346,52 +353,61 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
         end)
 
       transaction_hashes =
-        first_traces
-        |> Enum.map(fn first_trace ->
-          Map.get(first_trace, :transaction_hash)
+        valid_internal_transactions
+        |> Enum.map(fn valid_internal_transaction ->
+          Map.get(valid_internal_transaction, :transaction_hash)
         end)
         |> Enum.filter(fn hash -> hash != nil end)
 
       transaction_hashes_count = Enum.count(transaction_hashes)
 
-      Enum.reduce(transaction_hashes, 0, fn transaction_hash, acc ->
-        first_trace_params =
-          params
-          |> Enum.filter(fn first_trace ->
-            first_trace.transaction_hash == transaction_hash
-          end)
-          |> Enum.at(0)
+      result =
+        Enum.reduce_while(transaction_hashes, 0, fn transaction_hash, transaction_hashes_iterator ->
+          first_trace_params =
+            params
+            |> Enum.filter(fn first_trace ->
+              first_trace.transaction_hash == transaction_hash
+            end)
+            |> Enum.at(0)
 
-        update_query =
-          from(
-            t in Transaction,
-            where: t.hash == ^transaction_hash,
-            # ShareLocks order already enforced by `acquire_transactions` (see docs: sharelocks.md)
-            update: [
-              set: [
-                created_contract_address_hash: ^first_trace_params.created_contract_address_hash,
-                error: ^first_trace_params.error,
-                status: ^first_trace_params.status,
-                updated_at: ^timestamps.updated_at
+          update_query =
+            from(
+              t in Transaction,
+              where: t.hash == ^transaction_hash,
+              # ShareLocks order already enforced by `acquire_transactions` (see docs: sharelocks.md)
+              update: [
+                set: [
+                  created_contract_address_hash: ^first_trace_params.created_contract_address_hash,
+                  error: ^first_trace_params.error,
+                  status: ^first_trace_params.status,
+                  updated_at: ^timestamps.updated_at
+                ]
               ]
-            ]
-          )
+            )
 
-        acc = acc + 1
+          transaction_hashes_iterator = transaction_hashes_iterator + 1
 
-        try do
-          {_transaction_count, result} = repo.update_all(update_query, [], timeout: timeout)
+          try do
+            {_transaction_count, result} = repo.update_all(update_query, [], timeout: timeout)
 
-          if transaction_hashes_count == acc do
-            {:ok, result}
-          else
-            acc
+            if transaction_hashes_count == transaction_hashes_iterator do
+              {:halt, result}
+            else
+              {:cont, transaction_hashes_iterator}
+            end
+          rescue
+            postgrex_error in Postgrex.Error ->
+              {:halt, %{exception: postgrex_error, transaction_hashes: transaction_hashes}}
           end
-        rescue
-          postgrex_error in Postgrex.Error ->
-            {:error, %{exception: postgrex_error, transaction_hashes: transaction_hashes}}
-        end
-      end)
+        end)
+
+      case result do
+        %{exception: _} ->
+          {:error, result}
+
+        _ ->
+          {:ok, result}
+      end
     end
   end
 
